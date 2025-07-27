@@ -4,6 +4,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { cleanPhone, formatPhoneE164, mapCustomFields, calculateRentTotals } from "../../../lib/utils.ts";
 
 // Validate critical environment variables
 const criticalEnvVars = [
@@ -19,6 +20,14 @@ const supa = createClient(Deno.env.get("SUPABASE_URL"), Deno.env.get("SUPABASE_S
 // ─────────────────────────────── GHL constants ───────────────────────────────
 const LOCATION_ID = "v5jAtUx8vmG1ucKOCjA8"; // 🔑 Required for location-level API keys
 
+// Load all custom field IDs from environment once
+const CUSTOM_FIELD_IDS = {
+  TENANT_ID: Deno.env.get("CF_SUPABASE_TENANT_ID"),
+  SECONDARY_PHONE: Deno.env.get("CF_SECONDARY_PHONE"),
+  YEARLY_RENT_TOTALS: Deno.env.get("CF_YEARLY_RENT_TOTALS_JSON"),
+  TOTAL_LIFETIME_RENT: Deno.env.get("CF_TOTAL_LIFETIME_RENT")
+};
+
 const GHL = {
   KEY: Deno.env.get("GHL_API_KEY"),
   KEY_V2: Deno.env.get("GHL_API_V2_KEY"),
@@ -31,35 +40,6 @@ const GHL = {
     BOOKED_2026: Deno.env.get("STAGE_BOOKED_2026_ID"),
     PAST_GUEST: Deno.env.get("STAGE_PAST_GUEST_ID")
   }
-};
-
-// helper – trims to digits & 15-char max
-const cleanPhone = (s) => s?.replace(/\D/g, "").slice(0, 15);
-
-// wrapper for GHL v1 API calls
-const ghlFetch = async (url, opts) => {
-  // Create headers with LocationId
-  const headers = {
-    Authorization: `Bearer ${GHL.KEY}`,
-    "Content-Type": "application/json",
-    LocationId: LOCATION_ID,
-    ...(opts.headers || {})
-  };
-  
-  console.log(`GHL v1 request to ${url} with headers:`, JSON.stringify(headers));
-  
-  const res = await fetch(url, {
-    ...opts,
-    headers
-  });
-  
-  if (!res.ok) {
-    const errorText = await res.text();
-    console.error(`GHL ${url} failed ${res.status}`, errorText);
-    throw new Error(`GHL ${url} ${res.status}`);
-  }
-  
-  return res;
 };
 
 // wrapper for GHL v2 API calls
@@ -127,11 +107,41 @@ const getContactByEmailV2 = async (email) => {
   }
 };
 
-// Helper function to map customFields from object to array
-function mapCustomFields(customFields) {
-  console.log("🔥 NEW mapper hit - converting customFields from object to array");
-  return Object.entries(customFields || {}).map(([id, value]) => ({ id, value }));
-}
+// Get contact by phone using v2 API
+const getContactByPhoneV2 = async (phone) => {
+  if (!phone) return null;
+  
+  try {
+    // Include locationId as query parameter
+    const response = await ghlFetchV2(`https://services.leadconnectorhq.com/contacts/lookup?phone=${encodeURIComponent(phone)}`, {
+      method: "GET"
+    });
+    
+    const data = await response.json();
+    return data?.contacts?.[0] || null;
+  } catch (error) {
+    console.error(`Error looking up contact by phone: ${error.message}`);
+    return null;
+  }
+};
+
+// Get contact by query (confirmation number or tenant ID)
+const getContactByQueryV2 = async (query) => {
+  if (!query) return null;
+  
+  try {
+    // Include locationId as query parameter
+    const response = await ghlFetchV2(`https://services.leadconnectorhq.com/contacts?query=${encodeURIComponent(query)}&locationId=${LOCATION_ID}`, {
+      method: "GET"
+    });
+    
+    const data = await response.json();
+    return data?.contacts?.[0] || null;
+  } catch (error) {
+    console.error(`Error looking up contact by query: ${error.message}`);
+    return null;
+  }
+};
 
 // Create or update contact using v2 API
 const upsertContactV2 = async (contactData) => {
@@ -288,13 +298,13 @@ serve(async () => {
           const firstPhone = r.tenant_phone[0];
           console.log(`Processing first phone number: ${firstPhone}`);
           
-          const cleanedPhone = cleanPhone(firstPhone);
-          if (cleanedPhone && cleanedPhone.length >= 10 && cleanedPhone.length <= 15 && !cleanedPhone.startsWith('0')) {
-            // Format the phone number with international format
-            contact.phone = `+${cleanedPhone}`;
-            console.log(`Using cleaned phone: ${contact.phone}`);
+          const formattedPhone = formatPhoneE164(firstPhone);
+          if (formattedPhone && formattedPhone.length >= 10 && formattedPhone.length <= 15) {
+            // Use the E.164 formatted phone number
+            contact.phone = formattedPhone;
+            console.log(`Using formatted phone: ${contact.phone}`);
           } else if (firstPhone) {
-            console.log(`Invalid phone number after cleaning: ${cleanedPhone}`);
+            console.log(`Invalid phone number after formatting: ${formattedPhone}`);
           }
           
           // Process the second phone number if available
@@ -302,21 +312,20 @@ serve(async () => {
             const secondPhone = r.tenant_phone[1];
             console.log(`Processing second phone number: ${secondPhone}`);
             
-            const cleanedSecondPhone = cleanPhone(secondPhone);
-            if (cleanedSecondPhone && cleanedSecondPhone.length >= 10 && cleanedSecondPhone.length <= 15 && !cleanedSecondPhone.startsWith('0')) {
-              // Get the custom field ID for secondary phone
-              const cfSecondaryPhoneId = Deno.env.get("CF_SECONDARY_PHONE");
-              if (cfSecondaryPhoneId) {
+            const formattedSecondPhone = formatPhoneE164(secondPhone);
+            if (formattedSecondPhone && formattedSecondPhone.length >= 10 && formattedSecondPhone.length <= 15) {
+              // Use the custom field ID for secondary phone from constants
+              if (CUSTOM_FIELD_IDS.SECONDARY_PHONE) {
                 contact.customField.push({
-                  id: cfSecondaryPhoneId,
-                  value: `+${cleanedSecondPhone}`
+                  id: CUSTOM_FIELD_IDS.SECONDARY_PHONE,
+                  value: formattedSecondPhone
                 });
-                console.log(`Added second phone as custom field: +${cleanedSecondPhone}`);
+                console.log(`Added second phone as custom field: ${formattedSecondPhone}`);
               } else {
                 console.log(`No custom field ID for secondary phone found, skipping second phone`);
               }
             } else if (secondPhone) {
-              console.log(`Invalid second phone number after cleaning: ${cleanedSecondPhone}`);
+              console.log(`Invalid second phone number after formatting: ${formattedSecondPhone}`);
             }
           }
         } else {
@@ -332,10 +341,9 @@ serve(async () => {
           console.log(`No assignedTo found for user_id ${r.user_id}`);
         }
         
-        // Add only the tenant ID custom field for simplicity
-        const cfTenantId = Deno.env.get("CF_SUPABASE_TENANT_ID");
-        if (cfTenantId) {
-          contact.customField.push({ id: cfTenantId, value: String(r.id) });
+        // Add tenant ID custom field using the constant defined at the top
+        if (CUSTOM_FIELD_IDS.TENANT_ID) {
+          contact.customField.push({ id: CUSTOM_FIELD_IDS.TENANT_ID, value: String(r.id) });
         }
         
         // rent-totals
@@ -346,9 +354,31 @@ serve(async () => {
           // existing is now declared at the top of the loop
           
           try {
-            // Use v2 API to look up contact
+            // First try to look up contact by email
             console.log(`Searching for existing contact with email ${r.tenant_email}`);
             existing = await getContactByEmailV2(r.tenant_email);
+            
+            // If not found by email, try by phone
+            if (!existing && contact.phone) {
+              console.log(`No contact found by email, trying phone ${contact.phone}`);
+              existing = await getContactByPhoneV2(contact.phone);
+            }
+            
+            // If still not found, try by confirmation number or tenant ID
+            if (!existing) {
+              // Try confirmation number first if available
+              if (r.confirmation_number) {
+                console.log(`No contact found by email or phone, trying confirmation number ${r.confirmation_number}`);
+                existing = await getContactByQueryV2(r.confirmation_number);
+              }
+              
+              // Finally try tenant ID if still not found
+              if (!existing) {
+                console.log(`No contact found, trying tenant ID ${r.id}`);
+                existing = await getContactByQueryV2(String(r.id));
+              }
+            }
+            
             console.log(`Found existing contact: ${existing ? 'yes' : 'no'}`);
           } catch (error) {
             console.error(`Error searching GHL contact: ${error.message}`);
@@ -356,41 +386,37 @@ serve(async () => {
           }
           
           // Safe JSON parsing
-          let totals = {};
+          let existingTotals = {};
           try {
             if (existing?.customField?.yearly_rent_totals_json) {
-              totals = JSON.parse(existing.customField.yearly_rent_totals_json);
-              console.log(`Parsed existing yearly_rent_totals_json: ${JSON.stringify(totals)}`);
+              existingTotals = JSON.parse(existing.customField.yearly_rent_totals_json);
+              console.log(`Parsed existing yearly_rent_totals_json: ${JSON.stringify(existingTotals)}`);
             }
           } catch (error) {
             console.error(`Error parsing yearly_rent_totals_json: ${error.message}`);
             // Continue with empty totals object
           }
           
-          totals[year] = (totals[year] ?? 0) + rent;
-          
-          // Calculate the total lifetime rent
-          const totalLifetimeRent = Object.values(totals).reduce((a, b) => a + Number(b), 0);
+          // Calculate rent totals using the utility function
+          const { yearlyTotals, totalLifetimeRent } = calculateRentTotals(rent, year, existingTotals);
           
           // Add yearly rent totals as a custom field with proper format
-          const yearlyRentTotalsId = Deno.env.get("CF_YEARLY_RENT_TOTALS_JSON");
-          if (yearlyRentTotalsId) {
+          if (CUSTOM_FIELD_IDS.YEARLY_RENT_TOTALS) {
             contact.customField.push({
-              id: yearlyRentTotalsId,
-              value: JSON.stringify(totals)
+              id: CUSTOM_FIELD_IDS.YEARLY_RENT_TOTALS,
+              value: JSON.stringify(yearlyTotals)
             });
           }
           
           // Add total lifetime rent as a custom field with proper format
-          const totalLifetimeRentId = Deno.env.get("CF_TOTAL_LIFETIME_RENT");
-          if (totalLifetimeRentId) {
+          if (CUSTOM_FIELD_IDS.TOTAL_LIFETIME_RENT) {
             contact.customField.push({
-              id: totalLifetimeRentId,
+              id: CUSTOM_FIELD_IDS.TOTAL_LIFETIME_RENT,
               value: String(totalLifetimeRent)
             });
           }
           
-          console.log(`Updated yearly_rent_totals_json: ${JSON.stringify(totals)}`);
+          console.log(`Updated yearly_rent_totals_json: ${JSON.stringify(yearlyTotals)}`);
           console.log(`Total lifetime rent: ${totalLifetimeRent}`);
         }
         
@@ -460,9 +486,9 @@ serve(async () => {
         
         console.log(`Using stage ID ${stageId} for tenant ${r.id}`);
         
-        // Only create opportunity if we have required fields
-        // Also ensure we're in the same rent > 0 && year condition as where we set existing
-        if (rent > 0 && year && stageId) {
+        // Create opportunity if we have required fields
+        // Allow rent = 0 and default to PAST_GUEST stage
+        if (year && stageId) {
           // upsert Opportunity with direct fetch
           try {
             // Create opportunity payload with proper TypeScript interface for v2 API
