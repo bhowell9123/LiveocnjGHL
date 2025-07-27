@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "lib": ["deno.window"],
+    "strict": true
+  },
+  "lint": {
+    "files": {
+      "include": ["**/*.ts"]
+    },
+    "rules": {
+      "tags": ["recommended"]
+    }
+  },
+  "fmt": {
+    "files": {
+      "include": ["**/*.ts"]
+    },
+    "options": {
+      "useTabs": false,
+      "lineWidth": 100,
+      "indentWidth": 2,
+      "singleQuote": false,
+      "proseWrap": "preserve"
+    }
+  },
+  "tasks": {
+    "check": "deno check **/*.ts",
+    "run:check-phone": "deno run --allow-net --allow-env --allow-read check-phone-formatting.ts",
+    "run:fix-phone": "deno run --allow-net --allow-env --allow-read fix-phone-formatting.ts",
+    "run:fix-phone:dry": "deno run --allow-net --allow-env --allow-read fix-phone-formatting.ts --dry-run"
+  },
+  "importMap": "import_map.json"
+}
