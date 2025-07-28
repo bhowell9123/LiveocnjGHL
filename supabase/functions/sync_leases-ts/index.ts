@@ -4,7 +4,8 @@
 // ──────────────────────────────────────────────────────────────────────────────
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { cleanPhone, formatPhoneE164, mapCustomFields, calculateRentTotals } from "../../../lib/utils.ts";
+import { cleanPhone, mapCustomFields, calculateRentTotals } from "../../../lib/utils.ts";
+import { splitAndFormatPhones } from "../../../lib/phone.ts";
 
 // Validate critical environment variables
 const criticalEnvVars = [
@@ -292,44 +293,64 @@ serve(async () => {
         };
         
         // Add phone with cleaning and validation (ensure 10-15 digits)
-        // Handle phone numbers properly - tenant_phone can be an array of phone numbers
-        if (r.tenant_phone && Array.isArray(r.tenant_phone) && r.tenant_phone.length > 0) {
-          // Process the first phone number for the primary phone field
-          const firstPhone = r.tenant_phone[0];
-          console.log(`Processing first phone number: ${firstPhone}`);
-          
-          const formattedPhone = formatPhoneE164(firstPhone);
-          if (formattedPhone && formattedPhone.length >= 10 && formattedPhone.length <= 15) {
-            // Use the E.164 formatted phone number
-            contact.phone = formattedPhone;
-            console.log(`Using formatted phone: ${contact.phone}`);
-          } else if (firstPhone) {
-            console.log(`Invalid phone number after formatting: ${formattedPhone}`);
-          }
-          
-          // Process the second phone number if available
-          if (r.tenant_phone.length > 1) {
-            const secondPhone = r.tenant_phone[1];
-            console.log(`Processing second phone number: ${secondPhone}`);
+        // Handle phone numbers properly - tenant_phone can be an array of phone numbers or a string
+        if (r.tenant_phone) {
+          if (Array.isArray(r.tenant_phone) && r.tenant_phone.length > 0) {
+            // Process the first phone number for the primary phone field
+            const firstPhone = r.tenant_phone[0];
+            console.log(`Processing first phone number: ${firstPhone}`);
             
-            const formattedSecondPhone = formatPhoneE164(secondPhone);
-            if (formattedSecondPhone && formattedSecondPhone.length >= 10 && formattedSecondPhone.length <= 15) {
-              // Use the custom field ID for secondary phone from constants
-              if (CUSTOM_FIELD_IDS.SECONDARY_PHONE) {
+            const [pri, sec] = splitAndFormatPhones(firstPhone);
+            if (pri) {
+              contact.phone = pri;
+              console.log(`Using formatted phone: ${contact.phone}`);
+              
+              // Add secondary phone if extracted
+              if (sec && CUSTOM_FIELD_IDS.SECONDARY_PHONE) {
+                contact.customField.push({
+                  id: CUSTOM_FIELD_IDS.SECONDARY_PHONE,
+                  value: sec
+                });
+                console.log(`Added extracted secondary phone as custom field: ${sec}`);
+              }
+            }
+            
+            // Process the second phone number if available and no secondary phone was extracted
+            if (r.tenant_phone.length > 1 && !sec) {
+              const secondPhone = r.tenant_phone[1];
+              console.log(`Processing second phone number: ${secondPhone}`);
+              
+              const [formattedSecondPhone] = splitAndFormatPhones(secondPhone);
+              if (formattedSecondPhone && CUSTOM_FIELD_IDS.SECONDARY_PHONE) {
                 contact.customField.push({
                   id: CUSTOM_FIELD_IDS.SECONDARY_PHONE,
                   value: formattedSecondPhone
                 });
                 console.log(`Added second phone as custom field: ${formattedSecondPhone}`);
-              } else {
-                console.log(`No custom field ID for secondary phone found, skipping second phone`);
               }
-            } else if (secondPhone) {
-              console.log(`Invalid second phone number after formatting: ${formattedSecondPhone}`);
             }
+          } else if (typeof r.tenant_phone === 'string') {
+            // Handle single string phone number (which might contain multiple numbers)
+            console.log(`Processing phone string: ${r.tenant_phone}`);
+            
+            const [pri, sec] = splitAndFormatPhones(r.tenant_phone);
+            if (pri) {
+              contact.phone = pri;
+              console.log(`Using formatted phone: ${contact.phone}`);
+            }
+            
+            if (sec && CUSTOM_FIELD_IDS.SECONDARY_PHONE) {
+              contact.customField.push({
+                id: CUSTOM_FIELD_IDS.SECONDARY_PHONE,
+                value: sec
+              });
+              console.log(`Added extracted secondary phone as custom field: ${sec}`);
+            }
+          } else {
+            console.log(`Invalid tenant_phone format for tenant ${r.id}`);
           }
         } else {
-          console.log(`No valid phone numbers found for tenant ${r.id}`);
+          console.log(`No phone number found for tenant ${r.id}`);
         }
         
         // Only add assignedTo if it exists

@@ -6,6 +6,7 @@
  * This script finds contacts with phone numbers that don't match the E.164 format
  * and updates them to use the correct format (+1XXXXXXXXXX).
  * It handles both primary and secondary phone fields.
+ * It also detects and splits concatenated phone numbers.
  * 
  * Usage:
  *   deno run --allow-net --allow-env --allow-read scripts/patch-phone-format.ts [options]
@@ -15,20 +16,29 @@
  *   --batch-size=200   Number of contacts to process in each batch (default: 200)
  *   --sleep=2000       Milliseconds to sleep between batches (default: 2000)
  *   --rate=200         Maximum number of contacts to process per minute (default: 200)
+ *   --filter="text"    Filter contacts by name (case-insensitive substring match)
+ *   --id=1234          Process only the contact with the specified tenant ID
  */
 
 import { parse } from "https://deno.land/std/flags/mod.ts";
+import { load } from "https://deno.land/std/dotenv/mod.ts";
 import { cleanPhone } from "../lib/utils.ts";
+import { isE164, splitAndFormatPhones } from "../lib/phone.ts";
+
+// Load environment variables from .env file
+await load({ export: true });
 
 // Parse command line arguments
 const args = parse(Deno.args, {
   boolean: ["dry-run"],
-  string: ["batch-size", "sleep", "rate"],
+  string: ["batch-size", "sleep", "rate", "filter", "id"],
   default: {
     "dry-run": false,
     "batch-size": "200",
     "sleep": "2000",
-    "rate": "200"
+    "rate": "200",
+    "filter": "",
+    "id": ""
   }
 });
 
@@ -36,6 +46,8 @@ const DRY_RUN = args["dry-run"];
 const BATCH_SIZE = parseInt(args["batch-size"], 10);
 const SLEEP_MS = parseInt(args["sleep"], 10);
 const RATE_LIMIT = parseInt(args["rate"], 10);
+const NAME_FILTER = args["filter"] ? args["filter"].toLowerCase() : "";
+const TENANT_ID = args["id"] ? args["id"] : "";
 
 // Get environment variables
 const ghlApiKey = Deno.env.get("GHL_API_V2_KEY");
@@ -59,30 +71,36 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Format phone number to E.164 format
-function formatPhoneToE164(phone: string): string {
-  const cleaned = cleanPhone(phone);
-  
-  // If the number is too short, return as is
-  if (cleaned.length < 10) return `+${cleaned}`;
-  
-  // If it's a US number (10 or 11 digits with leading 1)
-  if (cleaned.length === 10) {
-    return `+1${cleaned}`;
-  } else if (cleaned.length === 11 && cleaned.startsWith("1")) {
-    return `+${cleaned}`;
-  }
-  
-  // For other international numbers, just add the + prefix
-  return `+${cleaned}`;
-}
-
-// Check if a phone number is in E.164 format
+// Check if a phone number is in E.164 format and not a concatenated number
 function isE164Format(phone: string): boolean {
   if (!phone) return false;
   
-  // E.164 format: + followed by 1-15 digits
-  return /^\+\d{10,15}$/.test(phone);
+  // First check if it's in E.164 format
+  if (!isE164(phone)) return false;
+  
+  // Then check if it might be a concatenated number
+  // For US numbers, a proper E.164 format should be +1 followed by 10 digits (total 12 chars)
+  // If it's longer than 12 chars and starts with +1, it might be concatenated
+  if (phone.startsWith("+1") && phone.length > 12) {
+    return false; // Likely a concatenated number
+  }
+  
+  return true;
+}
+
+// Helper function for GHL API calls with proper headers
+async function ghlFetchV2(url: string, options: RequestInit = {}): Promise<Response> {
+  const headers = {
+    "Authorization": `Bearer ${ghlApiKey}`,
+    "Version": "2021-07-28",
+    "Content-Type": "application/json",
+    ...options.headers
+  };
+
+  return fetch(url, {
+    ...options,
+    headers
+  });
 }
 
 // Function to fetch all contacts from GoHighLevel with pagination
@@ -97,15 +115,8 @@ async function fetchAllContacts(): Promise<any[]> {
     try {
       console.log(`Fetching page ${page}...`);
       
-      const response = await fetch(
-        `https://services.leadconnectorhq.com/contacts?locationId=${ghlLocationId}&limit=100&page=${page}`,
-        {
-          headers: {
-            "Authorization": `Bearer ${ghlApiKey}`,
-            "Version": "2021-07-28",
-            "Content-Type": "application/json"
-          }
-        }
+      const response = await ghlFetchV2(
+        `https://services.leadconnectorhq.com/contacts?locationId=${ghlLocationId}&limit=100&page=${page}`
       );
       
       if (!response.ok) {
@@ -137,10 +148,26 @@ async function fetchAllContacts(): Promise<any[]> {
   return allContacts;
 }
 
+// Function to build update payload for a contact
+const buildUpdates = (c: any) => {
+  const [primary, secondary] = splitAndFormatPhones(c.phone ?? "");
+
+  // Skip if nothing to change
+  if (primary === c.phone && (!secondary || secondary === c.customFields?.[CF_SECONDARY_PHONE])) {
+    return null;
+  }
+
+  const payload: any = { phone: primary };
+  if (secondary) {
+    payload.customField = { [CF_SECONDARY_PHONE]: secondary };
+  }
+  return payload;
+};
+
 // Function to update a contact's phone numbers in GoHighLevel
 async function updateContactPhones(
   contactId: string,
-  primaryPhone: string,
+  primaryPhone: string | null,
   secondaryPhone: string | null
 ): Promise<boolean> {
   try {
@@ -155,17 +182,15 @@ async function updateContactPhones(
       return true;
     }
     
+    // Skip if primary phone is null
+    if (!primaryPhone) {
+      console.warn(`  ⚠️ Skipping update - primary phone is null`);
+      return false;
+    }
+    
     // First, get the current contact data to preserve other fields
-    const getResponse = await fetch(
-      `https://services.leadconnectorhq.com/contacts/${contactId}`,
-      {
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${ghlApiKey}`,
-          "Version": "2021-07-28",
-          "Content-Type": "application/json"
-        }
-      }
+    const getResponse = await ghlFetchV2(
+      `https://services.leadconnectorhq.com/contacts/${contactId}`
     );
     
     if (!getResponse.ok) {
@@ -199,20 +224,15 @@ async function updateContactPhones(
     // Prepare the update payload
     const updatePayload = {
       phone: primaryPhone,
-      customFields: customFields,
-      locationId: ghlLocationId
+      customFields: customFields
+      // locationId is not needed in the update payload and causes a 422 error
     };
     
     // Make the API call to update the contact
-    const response = await fetch(
+    const response = await ghlFetchV2(
       `https://services.leadconnectorhq.com/contacts/${contactId}`,
       {
         method: "PUT",
-        headers: {
-          "Authorization": `Bearer ${ghlApiKey}`,
-          "Version": "2021-07-28",
-          "Content-Type": "application/json"
-        },
         body: JSON.stringify(updatePayload)
       }
     );
@@ -222,10 +242,10 @@ async function updateContactPhones(
       throw new Error(`Error updating contact ${contactId}: ${response.status} ${response.statusText} - ${errorText}`);
     }
     
-    console.log(`  Successfully updated contact ${contactId}`);
+    console.log(`  ✅ Successfully updated contact ${contactId}`);
     return true;
   } catch (error) {
-    console.error(`  Error updating contact ${contactId}:`, error instanceof Error ? error.message : String(error));
+    console.error(`  ❌ Error updating contact ${contactId}:`, error instanceof Error ? error.message : String(error));
     return false;
   }
 }
@@ -242,8 +262,73 @@ async function main() {
     // Fetch all contacts
     const allContacts = await fetchAllContacts();
     
+    // Apply tenant ID filter if specified
+    let filteredContacts = allContacts;
+    if (TENANT_ID) {
+      console.log(`Filtering for tenant ID: ${TENANT_ID}`);
+      // Look for tenant ID in custom fields
+      filteredContacts = allContacts.filter(contact => {
+        if (Array.isArray(contact.customFields)) {
+          const tenantIdField = contact.customFields.find((field: any) =>
+            field.id === Deno.env.get("CF_SUPABASE_TENANT_ID") && field.value === TENANT_ID
+          );
+          return !!tenantIdField;
+        }
+        return false;
+      });
+      console.log(`Found ${filteredContacts.length} contacts with tenant ID ${TENANT_ID}`);
+      
+      // Print details of the found contacts
+      filteredContacts.forEach(contact => {
+        console.log(`Contact: ${contact.firstName} ${contact.lastName} (${contact.id})`);
+        console.log(`  Phone: ${contact.phone || "none"}`);
+        
+        // Check for secondary phone
+        if (Array.isArray(contact.customFields)) {
+          const secondaryPhoneField = contact.customFields.find((field: any) => field.id === cfSecondaryPhone);
+          if (secondaryPhoneField) {
+            console.log(`  Secondary Phone: ${secondaryPhoneField.value || "none"}`);
+          }
+        }
+        
+        // Test our splitAndFormatPhones function on the current phone
+        if (contact.phone) {
+          const [primary, secondary] = splitAndFormatPhones(contact.phone);
+          console.log(`  Split result: primary=${primary}, secondary=${secondary || "none"}`);
+        }
+      });
+    } else if (NAME_FILTER) {
+      console.log(`Filtering contacts by name: "${NAME_FILTER}"`);
+      // Filter by name (case-insensitive)
+      filteredContacts = allContacts.filter(contact => {
+        const fullName = `${contact.firstName || ""} ${contact.lastName || ""}`.toLowerCase();
+        return fullName.includes(NAME_FILTER.toLowerCase());
+      });
+      console.log(`Found ${filteredContacts.length} contacts matching name filter "${NAME_FILTER}"`);
+      
+      // Print details of the found contacts
+      filteredContacts.forEach(contact => {
+        console.log(`Contact: ${contact.firstName} ${contact.lastName} (${contact.id})`);
+        console.log(`  Phone: ${contact.phone || "none"}`);
+        
+        // Check for secondary phone
+        if (Array.isArray(contact.customFields)) {
+          const secondaryPhoneField = contact.customFields.find((field: any) => field.id === cfSecondaryPhone);
+          if (secondaryPhoneField) {
+            console.log(`  Secondary Phone: ${secondaryPhoneField.value || "none"}`);
+          }
+        }
+        
+        // Test our splitAndFormatPhones function on the current phone
+        if (contact.phone) {
+          const [primary, secondary] = splitAndFormatPhones(contact.phone);
+          console.log(`  Split result: primary=${primary}, secondary=${secondary || "none"}`);
+        }
+      });
+    }
+    
     // Filter contacts with phone numbers that need fixing
-    const contactsToFix = allContacts.filter(contact => {
+    const contactsToFix = filteredContacts.filter(contact => {
       // Check primary phone
       const needsPrimaryFix = contact.phone && !isE164Format(contact.phone);
       
@@ -252,7 +337,7 @@ async function main() {
       let needsSecondaryFix = false;
       
       if (Array.isArray(contact.customFields)) {
-        const secondaryPhoneField = contact.customFields.find(field => field.id === cfSecondaryPhone);
+        const secondaryPhoneField = contact.customFields.find((field: any) => field.id === cfSecondaryPhone);
         if (secondaryPhoneField) {
           hasSecondaryPhone = true;
           needsSecondaryFix = !isE164Format(secondaryPhoneField.value);
@@ -272,6 +357,7 @@ async function main() {
     // Process contacts in batches
     let successCount = 0;
     let failureCount = 0;
+    let skippedCount = 0;
     let processedInThisMinute = 0;
     let minuteStartTime = Date.now();
     
@@ -303,26 +389,38 @@ async function main() {
         // Get the secondary phone if it exists
         let currentSecondaryPhone = null;
         if (Array.isArray(contact.customFields)) {
-          const secondaryPhoneField = contact.customFields.find(field => field.id === cfSecondaryPhone);
+          const secondaryPhoneField = contact.customFields.find((field: any) => field.id === cfSecondaryPhone);
           if (secondaryPhoneField) {
             currentSecondaryPhone = secondaryPhoneField.value;
             console.log(`  Current secondary phone: ${currentSecondaryPhone}`);
           }
         }
         
-        // Format the phone numbers to E.164
-        const formattedPrimaryPhone = currentPrimaryPhone ? formatPhoneToE164(currentPrimaryPhone) : "";
-        const formattedSecondaryPhone = currentSecondaryPhone ? formatPhoneToE164(currentSecondaryPhone) : null;
+        // Format the phone numbers to E.164 using the new splitAndFormatPhones function
+        const [formattedPrimaryPhone, formattedSecondaryPhone] = currentPrimaryPhone ?
+          splitAndFormatPhones(currentPrimaryPhone) : [""];
+        
+        if (!formattedPrimaryPhone) {
+          console.log(`  💤 Skipping contact ${contact.id} - "${currentPrimaryPhone}" not salvageable`);
+          skippedCount++;
+          continue;
+        }
+        
+        // If we already have a secondary phone in the custom field, only use it if we didn't extract one
+        let secondaryPhone = formattedSecondaryPhone;
+        if (!secondaryPhone && currentSecondaryPhone) {
+          const [formattedCurrentSecondary] = splitAndFormatPhones(currentSecondaryPhone);
+          secondaryPhone = formattedCurrentSecondary;
+        }
         
         // Only update if the formatted phones are different from the current ones
-        if (formattedPrimaryPhone !== currentPrimaryPhone || formattedSecondaryPhone !== currentSecondaryPhone) {
-          console.log(`  Formatted primary phone: ${formattedPrimaryPhone}`);
-          if (formattedSecondaryPhone) {
-            console.log(`  Formatted secondary phone: ${formattedSecondaryPhone}`);
-          }
+        if (formattedPrimaryPhone !== currentPrimaryPhone || secondaryPhone !== currentSecondaryPhone) {
+          console.log(`  🛠️ Would fix contact ${contact.firstName} ${contact.lastName}`);
+          console.log(`   prev: ${currentPrimaryPhone}`);
+          console.log(`   new : ${formattedPrimaryPhone}  (secondary ➜ ${secondaryPhone || "none"})`);
           
           // Update the contact
-          const success = await updateContactPhones(contact.id, formattedPrimaryPhone, formattedSecondaryPhone);
+          const success = await updateContactPhones(contact.id, formattedPrimaryPhone, secondaryPhone);
           
           if (success) {
             successCount++;
@@ -348,6 +446,7 @@ async function main() {
     console.log("\n=== Summary ===");
     console.log(`Total contacts processed: ${contactsToFix.length}`);
     console.log(`${DRY_RUN ? "Would have updated" : "Successfully updated"}: ${successCount}`);
+    console.log(`Skipped (not salvageable): ${skippedCount}`);
     if (failureCount > 0) {
       console.log(`Failed to update: ${failureCount}`);
     }
