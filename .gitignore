@@ -46,3 +46,21 @@ Desktop.ini
 
 # Supabase
 supabase/.temp/
+
+# Data files with potentially sensitive information
+ghl_contacts_*.json
+tenant_supabase_examples.json
+*_verification-*.json
+*-verification-*.json
+verification-results-*.json
+sync-state-verification-*.json
+phone-digits-report-*.json
+duplicates.csv
+unmatched.csv
+ghl-formatting-issues.json
+sync_validation_report.json
+supabase-ghl-sync.json
+
+# Local configuration files that might contain credentials
+.env*
+!.env.local.template
